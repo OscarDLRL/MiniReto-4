@@ -27,6 +27,7 @@ setup(
             "waypoints = waypoints_puzzlebot.8_waypoints:main",
             "test = waypoints_puzzlebot.test_odometry:main",
             "pid_id = waypoints_puzzlebot.pid_identification:main",
+            "line_follow = waypoints_puzzlebot.line_follow:main"
 
         ],
     },

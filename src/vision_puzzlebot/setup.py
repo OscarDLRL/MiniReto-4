@@ -29,6 +29,7 @@ setup(
     entry_points={
         'console_scripts': [
             'traffic_detect = vision_puzzlebot.trafficlight_detect:main',
+            'line_follower = vision_puzzlebot.line_follower_camera:main',
         ],
     },
 )
