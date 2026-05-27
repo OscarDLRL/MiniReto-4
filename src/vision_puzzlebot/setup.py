@@ -30,6 +30,7 @@ setup(
         'console_scripts': [
             'traffic_detect = vision_puzzlebot.trafficlight_detect:main',
             'line_follower = vision_puzzlebot.line_follower_camera:main',
+            'camera = vision_puzzlebot.cam_publish:main',
         ],
     },
 )

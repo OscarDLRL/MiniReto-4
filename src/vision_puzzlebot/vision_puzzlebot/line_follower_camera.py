@@ -22,7 +22,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from cv_bridge import CvBridge
-from std_msgs.msg import Int16
+from std_msgs.msg import Int16, Float32
 from sensor_msgs.msg import Image
 
 
@@ -94,8 +94,10 @@ class LineFollowerCamera(Node):
         self.timer  = None
         self.sub    = None
 
+        self.last_centre = (-1,-1)
+
         # Publisher
-        self.line_error_pub = self.create_publisher(Int16, self.line_error_topic, 10)
+        self.line_error_pub = self.create_publisher(Float32, self.line_error_topic, 10)
 
         # Fuente de imagen
         if self.im_from_topic:
@@ -135,7 +137,7 @@ class LineFollowerCamera(Node):
           - binary        : imagen binarizada del ROI (para debug)
           - contours      : todos los contornos encontrados
           - best_contour  : contorno seleccionado (o None)
-          - line_error    : int en [-100, 100]
+          - line_error    : float en [-1, 1]
           - center_error  : float en [-1.0, 1.0]
           - crop_point    : fila donde empieza el ROI
         """
@@ -172,7 +174,14 @@ class LineFollowerCamera(Node):
             if M["m00"] == 0:
                 return float("inf")
             cx = int(M["m10"] / M["m00"])
-            return abs(cx - frame_cx)
+            cy = int(M["m01"] / M["m00"])
+
+            # Add points if the contour is too far away from the last reading
+            score = abs(cx - frame_cx) 
+            if self.last_centre[0] != -1:
+                score += (((cx-self.last_centre[0])**2 + (cy+self.last_centre[1])**2)**(1/2))
+            return score
+
 
         best_contour = None
         cx = frame_cx   # fallback: sin detección → error 0
@@ -189,7 +198,7 @@ class LineFollowerCamera(Node):
                 cy = cy_roi + crop_point
 
         center_error = (cx - width / 2) / (width / 2)
-        line_error   = int(np.clip(np.round(center_error * 100.0), -100, 100))
+        line_error   = (np.clip(center_error, -1, 1))
 
         return {
             "cx": cx,
@@ -242,7 +251,6 @@ class LineFollowerCamera(Node):
 
         # Texto de error
         text = (
-            f"line_error={result['line_error']:+d}  "
             f"center_err={result['center_error']:+.3f}"
         )
         cv2.putText(vis, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
@@ -264,9 +272,10 @@ class LineFollowerCamera(Node):
             frame = cv2.resize(frame, (self.cam_w, self.cam_h))
 
         result = self._detect_line(frame)
+        self.last_centre = (result["cx"],result["cy"])
 
         # Publicar error
-        self.line_error_pub.publish(Int16(data=int(result["line_error"])))
+        self.line_error_pub.publish(Float32(data=float(result["line_error"])))
 
         if self.debug:
             self.get_logger().info(
