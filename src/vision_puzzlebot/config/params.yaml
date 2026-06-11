@@ -1,0 +1,75 @@
+# ============================================================
+# params.yaml — Puzzlebot Tracker ajustado
+# ============================================================
+
+vision_traffic:
+  ros__parameters:
+
+    topic_im_read: True
+    im_topic: '/cam/img_raw'
+    image_debug: False
+    console_debug: False
+
+    camera_width: 640
+    camera_height: 480
+    half: 'left'
+
+    # HSV para verde con poca iluminación
+    red_hsv_lower: [0,150,70]
+    red_hsv_upper: [5,255,255]
+
+    red2_hsv_lower: [165,150,70]
+    red2_hsv_upper: [180,255,255]
+    
+    yellow_hsv_lower: [25,40,140]
+    yellow_hsv_upper: [58,255,255]
+
+    green_hsv_lower: [59,100,70]
+    green_hsv_upper: [85,255,255]
+
+    hsv_min_area: 2000
+
+vision_line_follower:
+  ros__parameters:
+    topic_im_read: True
+    im_topic: '/cam/img_raw'
+    line_error_topic: "/line_detector_error"
+    image_debug: False
+    crosswalk_debug: False
+    console_debug: True
+
+    camera_width: 640
+    camera_height: 480
+    camera_fps: 20
+    camera_sensor_id: 0
+
+    publish_rate_hz: 20.0
+    min_contour_area: 550
+    morph_kernel_size: 5
+
+control_line_follower:
+    ros__parameters:
+            wheel_radius: 0.05  
+            wheel_base: 0.19
+            invert: True
+
+            v_max: 0.5
+            follow_speed: 0.1
+            omega_max: 2.5
+            frequency: 100
+
+            kp_ang: 0.7
+            ki_ang: 0.0
+            kd_ang: 0.6
+
+            console_debug: True
+
+vision_YOLO:
+  ros__parameters:
+          engine_path: 'models/yolov4-tiny-signs_best_fp16.engine'
+          names_path: 'models/obj.names'
+          confidence_threshold: 0.75
+          show_window: False
+
+
+      

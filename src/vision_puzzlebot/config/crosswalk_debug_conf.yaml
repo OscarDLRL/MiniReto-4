@@ -1,0 +1,18 @@
+line_follower_camera:
+  ros__parameters:
+    topic_im_read: False
+    im_topic: '/cam/img_raw'
+    line_error_topic: "/line_detector_error"
+    image_debug: False
+    crosswalk_debug: True
+    console_debug: False
+
+    camera_width: 640
+    camera_height: 480
+    camera_fps: 20
+    camera_sensor_id: 0
+
+    publish_rate_hz: 20.0
+    min_contour_area: 380 
+    morph_kernel_size: 5
+

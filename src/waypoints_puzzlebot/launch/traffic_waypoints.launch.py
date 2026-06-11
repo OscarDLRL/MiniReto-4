@@ -12,13 +12,11 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
-    """
     params_file = PathJoinSubstitution([
         FindPackageShare('waypoints_puzzlebot'),
         'config',
         'params.yaml'
     ])
-    """
 
     return LaunchDescription([
         DeclareLaunchArgument('detect_area', default_value='left'),

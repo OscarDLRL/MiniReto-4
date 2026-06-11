@@ -1,16 +1,24 @@
-#!/bin/python3
-
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32, String, Int16
+from std_msgs.msg import Float32, String, Int16, Bool
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 import time
 import math
+from enum import Enum
+from collections import Counter
 
 import numpy as np
 
+class STATES(Enum):
+    LINE_FOLLOW = 1
+    STOP = 2
+    TURN_RIGHT = 3
+    TURN_LEFT = 4
+    STRAIGHT = 5
+    GIVE_WAY = 6
+    ADVANCE_TO_CROSS = 7
 
-class WaypointPIDController(Node):
+class PuzzlebotController(Node):
     def __init__(self):
         super().__init__('waypoint_traffic_controller')
 
@@ -23,13 +31,21 @@ class WaypointPIDController(Node):
         self.sub_L = self.create_subscription(Float32,'/VelocityEncL',self.cb_L,qos_encoders)
         self.sub_R = self.create_subscription(Float32,'/VelocityEncR',self.cb_R,qos_encoders)
         self.sub_traffic_light = self.create_subscription(String, '/Traffic_light', self.cb_color, 10) 
-        self.sub_center_error = self.create_subscription(Float32, '/line_detector_error', self.cb_line, 10)  # typo corregido
+        self.sub_center_error = self.create_subscription(Float32, '/line_detector_error', self.cb_line, 10)
+        self.sub_yolo_state = self.create_subscription(String,'/traffic_sign',self.cb_yolo_state,10)
+        self.sub_cross_bool = self.create_subscription(Bool,'/crosswalk_bool',self.cb_cross_bool,10)
+        self.sub_cross_ang = self.create_subscription(Float32,'/crosswalk_ang',self.cb_cross_ang,10)
+        self.sub_stop_area = self.create_subscription(Float32,'/stop_area',self.cb_stop_area,10)
+
+        # YOLO states
+        self.state = STATES.LINE_FOLLOW
+        self.yolo_state = "none"
+        self.state_start_time = time.time()
 
         # Robot params
         self.declare_parameter('wheel_radius', 0.05)
         self.declare_parameter('wheel_base', 0.19)
-        self.declare_parameter('invert_left',  True)   # ajusta según tu hardware
-        self.declare_parameter('invert_right', True)  # ajusta según tu hardware
+        self.declare_parameter('invert',  True)
 
         self.declare_parameter('v_max', 0.5)
         self.declare_parameter('follow_speed', 0.1)
@@ -47,13 +63,9 @@ class WaypointPIDController(Node):
         self.declare_parameter('ki_ang', 0.0)
         self.declare_parameter('kd_ang', 0.6)
 
-        # PID lineal
-        self.declare_parameter('kp_dist', 0.65)
-        self.declare_parameter('ki_dist', 0.05)  # subido de 0.01
-        self.declare_parameter('kd_dist', 0.0)
-
-        # Tolerancia
-        self.declare_parameter('pos_tol', 0.05)
+        # Debug and other utilities
+        self.declare_parameter('console_debug', False)
+        self.console_debug = self.get_parameter('console_debug').value
 
         # Velocity
         self.vel_L = 0.0
@@ -65,6 +77,7 @@ class WaypointPIDController(Node):
         self.v = 0.0
         self.theta = 0.0
         self.last_odom_time = time.time()
+        self.lastw = 0.0
 
         # Traffic Light
         self.traffic_light = "none"
@@ -87,7 +100,39 @@ class WaypointPIDController(Node):
         self.prev_ang_error = 0.0
         self.last_pid_time = time.time()
 
+        # Cruze peatonal
+        self.cross_bool = False
+        self.cross_ang = 0
+        self.last_detected_sign = "none"
+        self.advance_distance = 0.0
+        self.advance_goal = 0.26
+        self.aangle_goal = 0.0
+        self.aangle_theta = 0.0 # RADIANS
+        self.advance_finished_time = None
+        self.cross_ang_tolerance = 0.03
+        self.cross_w = 0.0
+
+        # Señal de alto 
+        self.stop_area = 0.0
+        self.stop_area_threshold = 26100.0
+
+        # ── Work Ahead (flag, no state) ──────────────────────────────────────
+        # En lugar de cambiar el estado, solo se activa este booleano.
+        # Reduce la velocidad base mientras esté activo, sin interrumpir
+        # ninguna otra maniobra (giros, cruce, etc.).
+        self.work_ahead = False
+        self.work_ahead_start = 0.0
+        self.work_ahead_duration = 2.0   # segundos que dura el efecto
+        self.work_ahead_speed = 0.06     # velocidad reducida mientras está activo
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Counter 
+        self.sign_counter = Counter()
+        self.sign_counter_min_votes = 3
+
         self.get_logger().info("Line follow PID Controller listo")
+
+    # ── Callbacks ────────────────────────────────────────────────────────────
 
     def cb_L(self, msg):
         self.vel_L = msg.data
@@ -100,6 +145,87 @@ class WaypointPIDController(Node):
 
     def cb_line(self, msg):
         self.line_error = msg.data
+    
+    def cb_stop_area(self, msg):
+        self.stop_area = msg.data
+    
+    def cb_cross_ang(self, msg):
+        self.cross_ang = msg.data
+
+    def cb_cross_bool(self, msg):
+        new_cross = msg.data
+
+        # Detecta flanco de subida: antes False, ahora True.
+        if new_cross and not self.cross_bool and self.state == STATES.LINE_FOLLOW:
+            if self.console_debug:
+                self.get_logger().info("Crosswalk detectado!")
+
+            # Si había una señal guardada, avanza antes de ejecutar la acción.
+            if self.last_detected_sign != "none":
+                if len(self.sign_counter) > 0:
+                    self.last_detected_sign = self.sign_counter.most_common(1)[0][0]
+
+                if self.console_debug:
+                    self.get_logger().info("EMPEZANDO A AVANZAR AL CROSSWALK")
+
+                if self.last_detected_sign == "give_way":
+                    self.state = STATES.GIVE_WAY
+                else:
+                    self.state = STATES.ADVANCE_TO_CROSS
+
+                self.state_start_time = time.time()
+                self.advance_distance = 0.0
+                self.advance_finished_time = None
+                self.aangle_goal = np.deg2rad(self.cross_ang)
+                self.aangle_theta = 0.0
+                self.cross_w = self.lastw
+                if abs(self.cross_w) < 0.01 and self.aangle_goal > self.cross_ang_tolerance * 10:
+                    self.cross_w = 0.25 * self.aangle_goal / abs(self.aangle_goal)
+
+        self.cross_bool = new_cross
+
+    def cb_yolo_state(self, msg):
+        new_yolo_state = msg.data
+
+        if new_yolo_state == "none":
+            self.yolo_state = "none"
+            return
+
+        # STOP siempre se permite inmediatamente.
+        if new_yolo_state == "stop":
+            self.yolo_state = new_yolo_state
+            self.last_detected_sign = new_yolo_state
+            self.state = STATES.STOP
+            self.state_start_time = time.time()
+            return
+
+        # ── WORK_AHEAD: solo activa el flag, no cambia el estado ─────────────
+        # Así respeta cualquier maniobra que ya esté en curso.
+        if new_yolo_state == "work_ahead":
+            self.yolo_state = new_yolo_state
+            self.work_ahead = True
+            self.work_ahead_start = time.time()
+            return
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Cuenta señales vistas antes del crosswalk.
+        self.sign_counter[new_yolo_state] += 1
+
+        most_common_sign, votes = self.sign_counter.most_common(1)[0]
+        if votes >= self.sign_counter_min_votes:
+            self.last_detected_sign = most_common_sign
+
+        self.yolo_state = new_yolo_state
+
+        if not self.cross_bool:
+            return
+
+        if self.state != STATES.LINE_FOLLOW:
+            return
+
+        self.apply_saved_sign()
+
+    # ── Odometry ─────────────────────────────────────────────────────────────
 
     def update_odometry(self):
         now = time.time()
@@ -109,13 +235,12 @@ class WaypointPIDController(Node):
         if dt <= 0:
             return
 
-        r        = self.get_parameter('wheel_radius').value
-        b        = self.get_parameter('wheel_base').value
-        inv_L    = self.get_parameter('invert_left').value
-        inv_R    = self.get_parameter('invert_right').value
+        r   = self.get_parameter('wheel_radius').value
+        b   = self.get_parameter('wheel_base').value
+        inv = self.get_parameter('invert').value
 
-        wL = -self.vel_L if inv_L else self.vel_L
-        wR = -self.vel_R if inv_R else self.vel_R
+        wL = -self.vel_L if inv else self.vel_L
+        wR = -self.vel_R if inv else self.vel_R
 
         vL = wL * r
         vR = wR * r
@@ -125,15 +250,20 @@ class WaypointPIDController(Node):
 
         self.x     += v * math.cos(self.theta) * dt
         self.y     += v * math.sin(self.theta) * dt
-        self.v = v
+        self.v      = v
         self.theta += w * dt
         self.theta  = math.atan2(math.sin(self.theta), math.cos(self.theta))
 
+        # Solo usado en crosswalk
+        self.advance_distance += v * dt
+        self.aangle_theta     += w * dt
+
+    # ── Send velocity ─────────────────────────────────────────────────────────
+
     def send_velocity(self, v, w):
-        r     = self.get_parameter('wheel_radius').value
-        b     = self.get_parameter('wheel_base').value
-        inv_L = self.get_parameter('invert_left').value
-        inv_R = self.get_parameter('invert_right').value
+        r   = self.get_parameter('wheel_radius').value
+        b   = self.get_parameter('wheel_base').value
+        inv = self.get_parameter('invert').value
 
         # Traffic light logic
         if self.traffic_light == "green":
@@ -149,7 +279,7 @@ class WaypointPIDController(Node):
         # Ramp limiter
         max_accel = 0.2
         max_alpha = 4.0
-        dt_loop   =  1/self.freq
+        dt_loop   = 1 / self.freq
 
         dv = max_accel * dt_loop
         dw = max_alpha * dt_loop
@@ -167,22 +297,152 @@ class WaypointPIDController(Node):
         set_L = v_left  / r
         set_R = v_right / r
 
-        # Inversión individual por rueda
-        if inv_L:
+        if inv:
             set_L = -set_L
-        if inv_R:
             set_R = -set_R
 
         self.pub_L.publish(Float32(data=float(set_L)))
         self.pub_R.publish(Float32(data=float(set_R)))
 
+        self.lastw = w
+
+    # ── Apply sign ───────────────────────────────────────────────────────────
+
+    def apply_saved_sign(self):
+        if self.console_debug:
+            self.get_logger().info(f"APLICANDO {self.last_detected_sign}")
+
+        if self.last_detected_sign == "turn_right":
+            self.state = STATES.TURN_RIGHT
+        elif self.last_detected_sign == "turn_left":
+            self.state = STATES.TURN_LEFT
+        elif self.last_detected_sign == "straight":
+            self.state = STATES.STRAIGHT
+        elif self.last_detected_sign == "give_way":
+            self.state = STATES.GIVE_WAY
+        elif self.last_detected_sign == "stop":
+            self.state = STATES.STOP
+        else:
+            self.state = STATES.LINE_FOLLOW
+
+        self.state_start_time = time.time()
+        self.sign_counter.clear()
+        self.last_detected_sign = "none"
+
+    # ── Main loop ────────────────────────────────────────────────────────────
+
     def update(self):
         self.update_odometry()
+
+        elapsed = time.time() - self.state_start_time
+
+        # ── Apagar work_ahead si ya expiró ───────────────────────────────────
+        if self.work_ahead and (time.time() - self.work_ahead_start) > self.work_ahead_duration:
+            self.work_ahead = False
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Estado STOP
+        if self.state == STATES.STOP:
+            if self.stop_area > self.stop_area_threshold:
+                self.send_velocity(0.0, 0.0)
+                return
+            else:
+                self.state = STATES.LINE_FOLLOW
+                self.yolo_state = "none"
+
+        # Estado ADVANCE_TO_CROSS
+        if self.state == STATES.ADVANCE_TO_CROSS:
+            dist = self.advance_goal - self.advance_distance
+
+            if dist > 0:
+                if abs(self.aangle_goal - self.aangle_theta) < self.cross_ang_tolerance:
+                    self.send_velocity(0.10, 0.0)
+                else:
+                    self.send_velocity(0.10, self.cross_w)
+            else:
+                self.send_velocity(0.0, 0.0)
+
+                if self.advance_finished_time is None:
+                    self.advance_finished_time = time.time()
+
+                if time.time() - self.advance_finished_time >= 2.0:
+                    self.advance_finished_time = None
+                    self.get_logger().info("stopping...")
+
+                    # Second read removed
+                    """
+                    if self.cross_bool:
+                        self.apply_saved_sign()
+                        if self.console_debug:
+                            self.get_logger().info("found second Cross sign!")
+                    else:
+                        self.get_logger().info("huh")
+                        self.state = STATES.LINE_FOLLOW
+                    """
+
+                    self.apply_saved_sign()
+                    if self.console_debug:
+                        self.get_logger().info("Positioned in crosswalk!")
+
+            return
+
+        # Estado TURN_RIGHT
+        # work_ahead reduce la velocidad lineal incluso durante el giro.
+        if self.state == STATES.TURN_RIGHT:
+            v_turn = 0.03 if self.work_ahead else 0.05
+            self.send_velocity(v_turn, 1.0)
+
+            if elapsed > 1.2:
+                self.state = STATES.LINE_FOLLOW
+                self.yolo_state = "none"
+
+            return
+
+        # Estado TURN_LEFT
+        if self.state == STATES.TURN_LEFT:
+            v_turn = 0.03 if self.work_ahead else 0.05
+            self.send_velocity(v_turn, -1.0)
+
+            if elapsed > 1.2:
+                self.state = STATES.LINE_FOLLOW
+                self.yolo_state = "none"
+
+            return
+
+        # Estado STRAIGHT
+        if self.state == STATES.STRAIGHT:
+            v_straight = 0.07 if self.work_ahead else 0.12
+            self.send_velocity(v_straight, 0.0)
+
+            if elapsed > 1.0:
+                self.state = STATES.LINE_FOLLOW
+                self.yolo_state = "none"
+
+            return
+
+        # Estado GIVE_WAY
+        if self.state == STATES.GIVE_WAY:
+            self.send_velocity(0.0, 0.0)
+
+            if elapsed > 2.0:
+                self.last_detected_sign = "none"
+                self.sign_counter.clear()
+
+                self.state = STATES.ADVANCE_TO_CROSS
+                self.state_start_time = time.time()
+                self.advance_distance = 0.0
+                self.advance_finished_time = None
+
+            return
+
+        # ── LINE_FOLLOW con PID angular ───────────────────────────────────────
+        # La velocidad base se reduce automáticamente si work_ahead está activo.
+        v_base = self.work_ahead_speed if self.work_ahead else self.get_parameter('follow_speed').value
 
         e = float(self.line_error)
 
         now = time.time()
-        dt  = now - self.last_pid_time
+        dt = now - self.last_pid_time
         self.last_pid_time = now
 
         if dt <= 0.0:
@@ -192,32 +452,22 @@ class WaypointPIDController(Node):
         ki_a = self.get_parameter('ki_ang').value
         kd_a = self.get_parameter('kd_ang').value
 
-        self.get_logger().info(f"{kp_a}")
-
         self.int_ang += e * dt
-        int_limit     = self.w_max / (ki_a + 1e-9)
-        self.int_ang  = max(-int_limit, min(self.int_ang, int_limit))
+        int_limit = self.w_max / (ki_a + 1e-9)
+        self.int_ang = max(-int_limit, min(self.int_ang, int_limit))
 
         de_ang = (e - self.prev_ang_error) / dt
         self.prev_ang_error = e
 
-        omega = kp_a*e + ki_a*self.int_ang + kd_a*de_ang
-        self.get_logger().info(f"{omega}")
+        omega = kp_a * e + ki_a * self.int_ang + kd_a * de_ang
         omega = max(-self.w_max, min(omega, self.w_max))
-
-
-        v_base = self.get_parameter('follow_speed').value
 
         if abs(omega) > 0.15:
             v_base -= 0.05 * abs(omega)
-            self.get_logger().info("frenanding...")
 
         self.send_velocity(v_base, omega)
 
-        self.get_logger().info(
-            f"e={e:+.3f}  v={v_base:.3f}  ω={omega}  "
-            f"x={self.x:.2f}  y={self.y:.2f}  θ={math.degrees(self.theta):.1f}°"
-        )
+    # ── Shutdown ─────────────────────────────────────────────────────────────
 
     def destroy_node(self):
         target = time.time() + 1
@@ -229,7 +479,7 @@ class WaypointPIDController(Node):
 
 def main():
     rclpy.init()
-    node = WaypointPIDController()
+    node = PuzzlebotController()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
